@@ -1,51 +1,85 @@
 import { AnimatePresence, motion } from 'motion/react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Areas } from './components/Areas';
+import { GitHub } from './components/GitHub';
 import { Graph } from './components/Graph';
 import { Terminal } from './components/Terminal';
+import { Trail } from './components/Trail';
 import { cloneRepo, headLabel, type Repo } from './engine/repo';
-import { completions, diffTrees, replay, run, type GitEvent, type Line } from './engine/shell';
-import { LESSONS, type Lesson } from './lessons';
+import { completions, diffTrees, run, type GitEvent, type Line } from './engine/shell';
+import { continueInto, LESSONS, setupFor, type Lesson } from './lessons';
 
 const STORE = 'gitgym:v1';
+const REPO_STORE = 'gitgym:repo:v2';
 interface Saved {
   done: string[];
   current: string;
 }
-const load = (): Saved => {
+interface SavedRepo {
+  lesson: string;
+  repo: Repo;
+  start: Repo;
+}
+const read = (key: string): unknown => {
   try {
-    const s = JSON.parse(localStorage.getItem(STORE) ?? '');
-    if (Array.isArray(s.done) && typeof s.current === 'string') return s;
+    return JSON.parse(localStorage.getItem(key) ?? 'null');
   } catch {
-    /* first visit, private mode, or bad data */
+    return null; /* private mode or bad data */
   }
+};
+const write = (key: string, v: unknown) => {
+  try {
+    localStorage.setItem(key, JSON.stringify(v));
+  } catch {
+    /* storage blocked or full: progress just won't persist */
+  }
+};
+const load = (): Saved => {
+  const s = read(STORE) as Saved | null;
+  if (s && Array.isArray(s.done) && typeof s.current === 'string') return s;
   return { done: [], current: LESSONS[0].id };
 };
-const save = (s: Saved) => {
-  try {
-    localStorage.setItem(STORE, JSON.stringify(s));
-  } catch {
-    /* storage blocked: progress just won't persist */
-  }
+const isRepo = (r: unknown): r is Repo => {
+  const x = r as Repo | null;
+  return !!x && typeof x === 'object' && typeof x.commits === 'object' && typeof x.branches === 'object' && Array.isArray(x.branchOrder)
+    && typeof x.work === 'object' && typeof x.index === 'object' && typeof x.tracking === 'object' && typeof x.upstream === 'object'
+    && 'remote' in x && !!x.head && Array.isArray(x.stash);
+};
+const loadRepo = (lesson: string): SavedRepo | null => {
+  const s = read(REPO_STORE) as SavedRepo | null;
+  return s && s.lesson === lesson && isRepo(s.repo) && isRepo(s.start) ? s : null;
 };
 
-function welcome(lesson: Lesson): Line[] {
-  return [
-    { kind: 'out', text: `GitGym · ${lesson.title}` },
-    {
-      kind: 'explain',
-      text: lesson.setup.length ? 'The repo is ready. Start with "git status" or "git log --oneline".' : 'Type "help" any time for the commands that work here.',
-    },
-  ];
+function welcome(lesson: Lesson, carried: boolean): Line[] {
+  const lines: Line[] = [{ kind: 'out', text: `GitGym · ${lesson.chapter} · ${lesson.title}` }];
+  if (carried) lines.push({ kind: 'explain', text: 'Same project as before: everything you did so far is still here. Look at the trail, or start with "git status".' });
+  else lines.push({ kind: 'explain', text: LESSONS.indexOf(lesson) ? 'The project is ready, built up to this point. Start with "git status" or "git log --oneline".' : 'Type "help" any time for the commands that work here.' });
+  return lines;
 }
 
+/** The hint text the learner sees. Hints that are clicks rather than commands get a description. */
+const hintLabel = (h: string) => (h.startsWith('@pages') ? 'GitHub panel → Settings → Pages → Deploy from main' : h);
+
 type Flash = { kind: 'stage' | 'unstage' | 'commit' | null; key: number };
+type Box = { x: number; y: number; w: number; h: number };
+type Flight = { id: string; message: string; from: Box; key: number };
+type Packet = { id: string; from: Box; to: Box; delay: number; key: string };
+
+const boxOf = (el: Element | null): Box | null => {
+  if (!el) return null;
+  const r = el.getBoundingClientRect();
+  return r.width || r.height ? { x: r.left, y: r.top, w: r.width, h: r.height } : null;
+};
+const reduced = () => typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 export default function App() {
   const [saved, setSaved] = useState<Saved>(load);
   const lesson = LESSONS.find((l) => l.id === saved.current) ?? LESSONS[0];
-  const [repo, setRepo] = useState<Repo>(() => replay(lesson.setup));
-  const [lines, setLines] = useState<Line[]>(() => welcome(lesson));
+  const idx = LESSONS.indexOf(lesson);
+  const [boot] = useState(() => loadRepo(lesson.id));
+  const [startRepo, setStartRepo] = useState<Repo>(() => boot?.start ?? setupFor(idx));
+  const [repo, setRepo] = useState<Repo>(() => boot?.repo ?? startRepo);
+  const [lines, setLines] = useState<Line[]>(() => welcome(lesson, !!boot));
   const [typed, setTyped] = useState<string[]>([]);
   const [met, setMet] = useState<Set<number>>(new Set());
   const [hintsShown, setHintsShown] = useState(0);
@@ -55,13 +89,23 @@ export default function App() {
   const [open, setOpen] = useState<string | null>(null);
   const [inspect, setInspect] = useState<string | null>(null);
   const [menu, setMenu] = useState(false);
+  const [flight, setFlight] = useState<Flight | null>(null);
+  const [landing, setLanding] = useState<string | null>(null);
+  const [packets, setPackets] = useState<Packet[]>([]);
+  const [deployKey, setDeployKey] = useState(0);
 
-  useEffect(() => save(saved), [saved]);
+  useEffect(() => write(STORE, saved), [saved]);
+  useEffect(() => write(REPO_STORE, { lesson: lesson.id, repo, start: startRepo }), [lesson.id, repo, startRepo]);
 
-  const start = useCallback((l: Lesson) => {
+  /** Open a lesson. `carry` keeps the learner's own project and applies the lesson's setup on top. */
+  const start = useCallback((l: Lesson, carry: Repo | null) => {
+    const i = LESSONS.indexOf(l);
+    const carried = carry ? continueInto(carry, l) : null;
+    const r = carried ?? setupFor(i);
     setSaved((s) => ({ ...s, current: l.id }));
-    setRepo(replay(l.setup));
-    setLines(welcome(l));
+    setStartRepo(r);
+    setRepo(r);
+    setLines(welcome(l, !!carried));
     setTyped([]);
     setMet(new Set());
     setHintsShown(0);
@@ -69,7 +113,20 @@ export default function App() {
     setOpen(null);
     setInspect(null);
     setMenu(false);
+    setFlight(null);
+    setLanding(null);
+    setPackets([]);
   }, []);
+
+  const reset = () => {
+    setRepo(startRepo);
+    setLines(welcome(lesson, false));
+    setTyped([]);
+    setMet(new Set());
+    setPulse(null);
+    setLanding(null);
+    setFlight(null);
+  };
 
   // Goals are sticky: once ticked, they stay ticked.
   const check = (r: Repo, t: string[]) => {
@@ -91,18 +148,39 @@ export default function App() {
     if (complete && !saved.done.includes(lesson.id)) setSaved((s) => ({ ...s, done: [...s.done, lesson.id] }));
   }, [complete, lesson.id, saved.done]);
 
-  const react = (events: GitEvent[]) => {
+  const react = (events: GitEvent[], r: Repo) => {
+    const calm = reduced();
     for (const e of events) {
       if (e.type === 'commit') {
         setPulse(e.id);
         setFlash((f) => ({ kind: 'commit', key: f.key + 1 }));
+        const from = boxOf(document.querySelector('.ln-input'));
+        if (from && !calm && r.commits[e.id]) {
+          setLanding(e.id);
+          setFlight((f) => ({ id: e.id, message: r.commits[e.id].message, from, key: (f?.key ?? 0) + 1 }));
+        }
       } else if (e.type === 'stage') setFlash((f) => ({ kind: 'stage', key: f.key + 1 }));
       else if (e.type === 'unstage') setFlash((f) => ({ kind: 'unstage', key: f.key + 1 }));
+      else if (e.type === 'deploy') setDeployKey((k) => k + 1);
+      else if (e.type === 'open') setOpen(e.path);
+      else if (e.type === 'push' && !calm) {
+        // Read positions after this render, once the trail shows the ☁ badges.
+        requestAnimationFrame(() => {
+          const to = boxOf(document.querySelector('[data-github]'));
+          if (!to) return;
+          const ps: Packet[] = [];
+          e.ids.slice(0, 6).forEach((id, n) => {
+            const from = boxOf(document.querySelector(`[data-trail="${id}"]`));
+            if (from) ps.push({ id, from, to, delay: n * 0.08, key: `${id}-${Date.now()}` });
+          });
+          setPackets(ps);
+        });
+      }
     }
   };
 
   const where = repo.head.kind === 'detached' ? 'HEAD ' + repo.head.id : headLabel(repo);
-  const prompt = `~/gitgym${repo.initialized ? ` (${where}${repo.merging ? '|MERGING' : ''})` : ''} $ `;
+  const prompt = `~/my-site${repo.initialized ? ` (${where}${repo.merging ? '|MERGING' : ''})` : ''} $ `;
 
   const onRun = (cmd: string) => {
     const echo: Line = { kind: 'cmd', text: prompt + '\u0000' + cmd };
@@ -113,9 +191,22 @@ export default function App() {
     const t = [...typed, cmd];
     setTyped(t);
     setRepo(res.repo);
-    react(res.events);
+    react(res.events, res.repo);
     check(res.repo, t);
   };
+
+  /** A click in the GitHub panel: runs the hidden command without echoing it as typed. */
+  const enablePages = () => {
+    const res = run(repo, '@pages main');
+    setLines((ls) => [...ls, { kind: 'explain', text: 'You switched on GitHub Pages in the repo settings. GitHub now builds a website from main.' }, ...res.lines]);
+    const t = [...typed, '@pages main'];
+    setTyped(t);
+    setRepo(res.repo);
+    react(res.events, res.repo);
+    check(res.repo, t);
+  };
+
+  const pickHint = (h: string) => (h.startsWith('@pages') ? enablePages() : setDraft((d) => ({ text: h, key: d.key + 1 })));
 
   const saveFile = (path: string, text: string) => {
     const r = cloneRepo(repo);
@@ -126,7 +217,6 @@ export default function App() {
     setOpen(null);
   };
 
-  const idx = LESSONS.indexOf(lesson);
   const nextLesson = LESSONS[idx + 1];
   const chapters = useMemo(() => [...new Set(LESSONS.map((l) => l.chapter))], []);
 
@@ -145,7 +235,7 @@ export default function App() {
           </svg>
           GitGym
         </div>
-        <span className="tagline">learn git by doing it, and watching it happen</span>
+        <span className="tagline">build one website with git, and watch every step happen</span>
         <span className="progress">
           {saved.done.length}/{LESSONS.filter((l) => l.goals.length).length} lessons
         </span>
@@ -158,7 +248,7 @@ export default function App() {
             {LESSONS.filter((l) => l.chapter === ch).map((l) => {
               const done = saved.done.includes(l.id);
               return (
-                <button key={l.id} className={`lesson-link${l.id === lesson.id ? ' active' : ''}`} onClick={() => start(l)}>
+                <button key={l.id} className={`lesson-link${l.id === lesson.id ? ' active' : ''}`} onClick={() => l.id !== lesson.id && start(l, null)}>
                   <span className={`tick${done ? ' done' : ''}`}>{done ? '✓' : l.goals.length ? LESSONS.indexOf(l) + 1 : '∞'}</span>
                   {l.title}
                 </button>
@@ -173,7 +263,7 @@ export default function App() {
           <div className="brief-head">
             <span className="chapter-tag">{lesson.chapter}</span>
             <h1>{lesson.title}</h1>
-            <button className="ghost-btn" onClick={() => start(lesson)} title="Start this lesson over">
+            <button className="ghost-btn" onClick={reset} title="Put the project back how it was when this lesson started">
               ↺ Reset
             </button>
           </div>
@@ -198,8 +288,8 @@ export default function App() {
           )}
           <div className="hints">
             {lesson.hints.slice(0, hintsShown).map((h, i) => (
-              <button key={i} className="hint" onClick={() => setDraft((d) => ({ text: h, key: d.key + 1 }))} title="Put it in the terminal">
-                {h}
+              <button key={i} className={`hint${h.startsWith('@') ? ' hint-click' : ''}`} onClick={() => pickHint(h)} title={h.startsWith('@') ? 'Do it for me' : 'Put it in the terminal'}>
+                {hintLabel(h)}
               </button>
             ))}
             {hintsShown < lesson.hints.length && (
@@ -215,7 +305,7 @@ export default function App() {
                   <strong>Done.</strong> <Rich text={lesson.outro} />
                 </p>
                 {nextLesson && (
-                  <button className="primary" onClick={() => start(nextLesson)}>
+                  <button className="primary" onClick={() => start(nextLesson, repo)}>
                     Next: {nextLesson.title} →
                   </button>
                 )}
@@ -233,17 +323,83 @@ export default function App() {
           <h2>Where your changes are</h2>
           <Areas repo={repo} flash={flash} onOpen={setOpen} />
         </section>
+
+        <section className="panel">
+          <h2>GitHub</h2>
+          <GitHub repo={repo} deployKey={deployKey} onEnablePages={enablePages} />
+        </section>
       </main>
 
       <aside className="term-col">
+        <Trail repo={repo} landing={landing} onPick={setInspect} />
         <Terminal lines={lines} prompt={prompt} words={completions(repo)} onRun={onRun} draft={draft} />
       </aside>
+
+      {flight && (
+        <CommitFlight
+          key={flight.key}
+          flight={flight}
+          onDone={() => {
+            setLanding(null);
+            setFlight(null);
+          }}
+        />
+      )}
+      <div className="packets" aria-hidden>
+        {packets.map((p) => (
+          <motion.span
+            key={p.key}
+            className="packet"
+            initial={{ x: p.from.x + 14, y: p.from.y + p.from.h / 2, opacity: 0, scale: 0.6 }}
+            animate={{ x: p.to.x + p.to.w / 2, y: p.to.y + 18, opacity: [0, 1, 1, 0], scale: [0.6, 1, 1, 0.5] }}
+            transition={{ duration: 0.75, delay: p.delay, ease: 'easeInOut' }}
+            onAnimationComplete={() => setPackets((ps) => ps.filter((x) => x.key !== p.key))}
+          />
+        ))}
+      </div>
 
       <AnimatePresence>
         {open && <Editor key={'e' + open} path={open} repo={repo} onSave={saveFile} onClose={() => setOpen(null)} />}
         {inspect && repo.commits[inspect] && <Inspect key={'i' + inspect} id={inspect} repo={repo} onClose={() => setInspect(null)} />}
       </AnimatePresence>
     </div>
+  );
+}
+
+/**
+ * The commit message, lifted off the terminal line and carried to its stop on
+ * the trail. The real card stays invisible until this lands on top of it.
+ */
+function CommitFlight({ flight, onDone }: { flight: Flight; onDone: () => void }) {
+  const [to, setTo] = useState<Box | null>(null);
+  const done = useRef(onDone);
+  done.current = onDone;
+  useLayoutEffect(() => {
+    const target = document.querySelector(`[data-trail="${flight.id}"]`);
+    target?.scrollIntoView({ block: 'nearest' });
+    const b = boxOf(target);
+    if (b) setTo(b);
+    else done.current();
+  }, [flight.id]);
+  if (!to) return null;
+  const { from } = flight;
+  return (
+    <motion.div
+      className="flight"
+      initial={{ x: from.x + 24, y: from.y - 6, width: Math.min(from.w - 48, 360), opacity: 0, scale: 0.9 }}
+      animate={{
+        x: [from.x + 24, from.x + 24, to.x],
+        y: [from.y - 6, from.y - 40, to.y],
+        width: [Math.min(from.w - 48, 360), Math.min(from.w - 48, 360), to.w],
+        opacity: [0, 1, 1],
+        scale: [0.9, 1.04, 1],
+      }}
+      transition={{ duration: 0.9, times: [0, 0.25, 1], ease: 'easeInOut' }}
+      onAnimationComplete={() => done.current()}
+    >
+      <span className="flight-msg">{flight.message}</span>
+      <code>{flight.id}</code>
+    </motion.div>
   );
 }
 
@@ -289,14 +445,23 @@ function Editor({ path, repo, onSave, onClose }: { path: string; repo: Repo; onS
   const exists = repo.work[path] !== undefined;
   const [text, setText] = useState(repo.work[path] ?? repo.index[path] ?? '');
   const conflicted = /^(<<<<<<<|=======|>>>>>>>)/m.test(text);
+  const settle = (side: 'ours' | 'theirs' | 'both') =>
+    setText((s) => s.replace(/<<<<<<< [^\n]*\n([\s\S]*?)=======\n([\s\S]*?)>>>>>>> [^\n]*\n/g, (_m, o: string, th: string) => (side === 'ours' ? o : side === 'both' ? o + th : th)));
   return (
     <Modal title={<code>{path}</code>} onClose={onClose}>
       {!exists && <p className="muted">This file is deleted in your folder. Saving brings it back.</p>}
       {conflicted && (
         <p className="warn">
           Conflict markers: keep the lines you want and delete the <code>&lt;&lt;&lt;&lt;&lt;&lt;&lt;</code>, <code>=======</code> and{' '}
-          <code>&gt;&gt;&gt;&gt;&gt;&gt;&gt;</code> lines.
+          <code>&gt;&gt;&gt;&gt;&gt;&gt;&gt;</code> lines. Or settle every block at once:
         </p>
+      )}
+      {conflicted && (
+        <div className="settle">
+          <button className="ghost-btn" onClick={() => settle('ours')}>Keep mine (HEAD)</button>
+          <button className="ghost-btn" onClick={() => settle('theirs')}>Keep theirs</button>
+          <button className="ghost-btn" onClick={() => settle('both')}>Keep both</button>
+        </div>
       )}
       <textarea value={text} onChange={(e) => setText(e.target.value)} spellCheck={false} rows={10} autoFocus />
       <div className="modal-actions">

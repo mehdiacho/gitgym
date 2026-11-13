@@ -60,7 +60,7 @@ export function Graph({ repo, pulse, onPick }: Props) {
           {L.edges.map((e) => (
             <motion.path
               key={`${e.from}-${e.to}`}
-              initial={{ pathLength: 0, opacity: 0 }}
+              initial={{ pathLength: 0, opacity: 0, d: e.d }}
               animate={{ pathLength: 1, opacity: e.orphan ? 0.22 : 1, d: e.d }}
               exit={{ opacity: 0 }}
               transition={{ duration: 0.45, ease: 'easeOut' }}

@@ -8,6 +8,7 @@ import {
   headId,
   headLabel,
   headTree,
+  ignored,
   isAncestor,
   isClean,
   mergeBase,
@@ -33,7 +34,12 @@ export type GitEvent =
   | { type: 'move-head' }
   | { type: 'branch'; name: string }
   | { type: 'merge'; id: string | null }
-  | { type: 'files' };
+  | { type: 'files' }
+  | { type: 'push'; branch: string; ids: string[] }
+  | { type: 'fetch'; ids: string[] }
+  | { type: 'deploy'; id: string }
+  | { type: 'release'; tag: string }
+  | { type: 'open'; path: string };
 
 export interface RunResult {
   repo: Repo;
@@ -132,8 +138,10 @@ export function run(repo: Repo, input: string): RunResult {
 }
 
 const SHELL_HELP = `Files:  ls · cat <file> · touch <file> · echo "text" > <file> · echo "more" >> <file> · rm <file> · clear
+Edit:   edit <file> opens a file in the editor (code and nano work too)
 Git:    init · status · add · commit · log · diff · branch · switch · checkout · merge · rebase
         reset · restore · revert · cherry-pick · tag · stash · rm
+GitHub: remote · push · fetch · pull
 Tip:    chain steps with && · press ↑ for history · Tab completes`;
 
 function exec(c: Ctx, argv: string[]) {
@@ -184,6 +192,39 @@ function exec(c: Ctx, argv: string[]) {
     case 'clear':
       c.lines.push({ kind: 'out', text: '\u001bclear' });
       return;
+    case 'edit':
+    case 'code':
+    case 'nano':
+    case 'vim':
+    case 'open': {
+      const f = args[0];
+      if (!f) fail(`${cmd}: which file? like: edit index.html`);
+      checkName(f);
+      c.events.push({ type: 'open', path: f });
+      return;
+    }
+    case '@teammate':
+      return teammate(c, args);
+    case '@pages':
+      return enablePages(c, args[0] ?? 'main');
+    case '@line': {
+      // Hidden setup helper: replace line n of a file.
+      const [f, n, text] = args;
+      const lines = (c.repo.work[f] ?? '').split('\n');
+      if (lines[lines.length - 1] === '') lines.pop();
+      lines[Math.max(0, Number(n) - 1)] = text;
+      c.repo.work[f] = lines.join('\n') + '\n';
+      c.events.push({ type: 'files' });
+      return;
+    }
+    case '@resolve': {
+      // Hidden test helper: settle every conflict block in a file one way.
+      const [f, side] = args;
+      const re = /<<<<<<< [^\n]*\n([\s\S]*?)=======\n([\s\S]*?)>>>>>>> [^\n]*\n/g;
+      c.repo.work[f] = (c.repo.work[f] ?? '').replace(re, (_m, o: string, t: string) => (side === 'ours' ? o : side === 'both' ? o + t : t));
+      c.events.push({ type: 'files' });
+      return;
+    }
     case 'git':
       return git(c, args);
     default:
@@ -214,6 +255,7 @@ export function resolve(r: Repo, rev: string): string {
   if (base === 'HEAD' || base === '@') id = headId(r);
   else if (base in r.branches) id = r.branches[base];
   else if (base in r.tags) id = r.tags[base];
+  else if (base in r.tracking) id = r.tracking[base];
   else if (/^[0-9a-f]{4,}$/.test(base)) {
     const hits = Object.keys(r.commits).filter((k) => k.startsWith(base));
     if (hits.length > 1) fail(`error: short id ${base} is ambiguous`);
@@ -305,6 +347,16 @@ function git(c: Ctx, args: string[]) {
       return gDiff(c, rest);
     case 'show':
       return gShow(c, rest);
+    case 'remote':
+      return gRemote(c, rest);
+    case 'push':
+      return gPush(c, rest);
+    case 'fetch':
+      return gFetch(c, rest);
+    case 'pull':
+      return gPull(c, rest);
+    case 'clone':
+      return fail('GitGym builds one project from scratch, so there is nothing to clone. Use "git remote add" to connect it to GitHub.');
     default:
       fail(`git: '${sub}' isn't a git command GitGym knows yet. Type "help" for the list.`);
   }
@@ -327,6 +379,7 @@ function gStatus(c: Ctx) {
   const lines: string[] = [];
   lines.push(r.head.kind === 'branch' ? `On branch ${r.head.name}` : `HEAD detached at ${short(r.head.id)}`);
   if (!headId(r)) lines.push('', 'No commits yet');
+  lines.push(...(trackingLine(r) ?? []));
   if (r.merging) {
     lines.push(s.conflicts.length ? 'You have unmerged paths.' : 'All conflicts fixed but you are still merging.');
     lines.push(s.conflicts.length ? '  (fix conflicts and run "git commit")' : '  (use "git commit" to conclude merge)');
@@ -354,7 +407,8 @@ function gStatus(c: Ctx) {
 }
 
 function expandPaths(r: Repo, specs: string[], all: boolean): string[] {
-  const pool = new Set([...Object.keys(r.work), ...Object.keys(r.index)]);
+  // Ignored files only get in if git already tracks them.
+  const pool = new Set([...Object.keys(r.work).filter((p) => !ignored(r, p) || p in r.index), ...Object.keys(r.index)]);
   if (all) return [...pool].sort();
   const outp = new Set<string>();
   for (const s of specs) {
@@ -366,6 +420,8 @@ function expandPaths(r: Repo, specs: string[], all: boolean): string[] {
       if (!hits.length) fail(`fatal: pathspec '${s}' did not match any files`);
       hits.forEach((p) => outp.add(p));
     } else if (pool.has(s)) outp.add(s);
+    else if (s in r.work && ignored(r, s))
+      fail(`The following path is ignored by your .gitignore file:\n${s}\nhint: that's the point of .gitignore: git leaves it alone.`);
     else if ([...pool].some((p) => p.startsWith(s + '/'))) [...pool].filter((p) => p.startsWith(s + '/')).forEach((p) => outp.add(p));
     else fail(`fatal: pathspec '${s}' did not match any files`);
   }
@@ -452,7 +508,7 @@ const sorted = (t: Tree) => Object.fromEntries(Object.entries(t).sort(([a], [b])
 function gLog(c: Ctx, args: string[]) {
   const { set, rest } = flags(args);
   const r = c.repo;
-  const starts = set.has('--all') ? [...Object.values(r.branches), headId(r)].filter(Boolean) as string[] : [rest[0] ? resolve(r, rest[0]) : headId(r)].filter(Boolean) as string[];
+  const starts = set.has('--all') ? [...Object.values(r.branches), ...Object.values(r.tracking), headId(r)].filter(Boolean) as string[] : [rest[0] ? resolve(r, rest[0]) : headId(r)].filter(Boolean) as string[];
   if (!starts.length) fail(`fatal: your current branch '${headLabel(r)}' does not have any commits yet`);
   const seen = new Set<string>();
   for (const s of starts) ancestors(r, s).forEach((x) => seen.add(x));
@@ -477,6 +533,7 @@ function decorations(r: Repo, id: string): string {
     if (r.branches[b] !== id) continue;
     d.push(r.head.kind === 'branch' && r.head.name === b ? `HEAD -> ${b}` : b);
   }
+  for (const [t, tid] of Object.entries(r.tracking)) if (tid === id) d.push(t);
   for (const [t, tid] of Object.entries(r.tags)) if (tid === id) d.push(`tag: ${t}`);
   return d.join(', ');
 }
@@ -519,8 +576,10 @@ function gBranch(c: Ctx, args: string[]) {
   if (set.has('-m') || set.has('-M')) {
     // handled by flags as message; unsupported here
   }
+  if (!rest.length && set.has('-r')) return out(c, Object.keys(r.tracking).sort().map((t) => '  ' + t).join('\n') || '(no remote branches yet: try git fetch)');
   if (!rest.length) {
     const lines = r.branchOrder.map((b) => `${r.head.kind === 'branch' && r.head.name === b ? '* ' : '  '}${b}`);
+    if (set.has('-a')) lines.push(...Object.keys(r.tracking).sort().map((t) => `  remotes/${t}`));
     if (r.head.kind === 'detached') lines.unshift(`* (HEAD detached at ${short(r.head.id)})`);
     return out(c, lines.join('\n') || '(no branches yet)');
   }
@@ -600,6 +659,15 @@ function gSwitch(c: Ctx, args: string[]) {
   const name = rest[0];
   if (!name) fail('fatal: missing branch name, like: git switch main');
   if (name === '-') fail('GitGym does not track "previous branch" yet; name it instead.');
+  if (!(name in r.branches) && r.remote && `${r.remote.name}/${name}` in r.tracking) {
+    const remoteRef = `${r.remote.name}/${name}`;
+    createBranch(c, name, r.tracking[remoteRef]);
+    r.upstream[name] = name;
+    moveTo(c, r.tracking[remoteRef], { kind: 'branch', name });
+    out(c, `branch '${name}' set up to track '${remoteRef}'.\nSwitched to a new branch '${name}'`);
+    explain(c, `There was no local ${name}, but ${remoteRef} exists, so git made a local ${name} starting there and linked the two.`);
+    return;
+  }
   if (!(name in r.branches)) {
     if (/^[0-9a-f]{4,}$/.test(name) || /[~^]/.test(name) || name in r.tags)
       fail(`fatal: a branch is expected, got '${name}'.\nhint: to look at a commit, use "git switch --detach ${name}" or "git checkout ${name}"`);
@@ -906,15 +974,20 @@ function gStash(c: Ctx, args: string[]) {
       if (r.work[p] !== head[p] || r.index[p] !== head[p]) blocked.push(p);
     }
     if (blocked.length) fail(`error: your local changes to ${listNames(blocked)} would be overwritten. Commit or stash them first.`);
+    // Replay the stashed edits on top of whatever HEAD is now, line by line.
+    const work = mergeTrees(base, head, s.work, 'Updated upstream', 'Stashed changes');
+    const index = mergeTrees(base, head, s.index, 'Updated upstream', 'Stashed changes');
+    const clash = [...new Set([...work.conflicts, ...index.conflicts])];
+    if (clash.length) fail(`error: your stashed changes clash with newer commits in ${listNames(clash)}. The stash is kept; commit and merge instead.`);
     for (const p of new Set([...Object.keys(s.work), ...Object.keys(base)])) {
       if (s.work[p] === base[p]) continue;
-      if (s.work[p] === undefined) delete r.work[p];
-      else r.work[p] = s.work[p];
+      if (work.tree[p] === undefined) delete r.work[p];
+      else r.work[p] = work.tree[p];
     }
     for (const p of new Set([...Object.keys(s.index), ...Object.keys(base)])) {
       if (s.index[p] === base[p]) continue;
-      if (s.index[p] === undefined) delete r.index[p];
-      else r.index[p] = s.index[p];
+      if (index.tree[p] === undefined) delete r.index[p];
+      else r.index[p] = index.tree[p];
     }
     if (sub === 'pop') r.stash.shift();
     out(c, sub === 'pop' ? 'Restored your stashed changes and dropped the stash.' : 'Applied stash@{0}.');
@@ -995,6 +1068,212 @@ function gShow(c: Ctx, args: string[]) {
   out(c, `commit ${id}\n\n    ${cm.message}\n\n${diffTrees(treeOf(r, cm.parents[0] ?? null), cm.tree)}`);
 }
 
+// ---------------------------------------------------------------- GitHub (simulated)
+
+function needRemote(r: Repo) {
+  if (!r.remote) fail("fatal: this repository isn't connected to GitHub yet.\nhint: git remote add origin https://github.com/you/my-site.git");
+  return r.remote!;
+}
+
+/** Commits reachable from `to` but not from `from`, oldest first. */
+function newCommits(r: Repo, to: string, from: string | null | undefined): string[] {
+  const have = from ? ancestors(r, from) : new Set<string>();
+  return [...ancestors(r, to)].filter((id) => !have.has(id)).sort((a, b) => r.commits[a].seq - r.commits[b].seq);
+}
+
+const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? '' : 's'}`;
+
+function trackingLine(r: Repo): string[] | null {
+  if (r.head.kind !== 'branch' || !r.remote) return null;
+  const up = r.upstream[r.head.name];
+  if (!up) return null;
+  const ref = `${r.remote.name}/${up}`;
+  const theirs = r.tracking[ref];
+  const ours = headId(r);
+  if (!theirs || !ours) return null;
+  const ahead = newCommits(r, ours, theirs).length;
+  const behind = newCommits(r, theirs, ours).length;
+  if (!ahead && !behind) return [`Your branch is up to date with '${ref}'.`];
+  if (ahead && !behind) return [`Your branch is ahead of '${ref}' by ${plural(ahead, 'commit')}.`, '  (use "git push" to publish your local commits)'];
+  if (behind && !ahead)
+    return [`Your branch is behind '${ref}' by ${plural(behind, 'commit')}, and can be fast-forwarded.`, '  (use "git pull" to update your local branch)'];
+  return [
+    `Your branch and '${ref}' have diverged,`,
+    `and have ${ahead} and ${behind} different commits each, respectively.`,
+    '  (use "git pull" to merge the remote branch into yours)',
+  ];
+}
+
+function gRemote(c: Ctx, args: string[]) {
+  const { set, rest } = flags(args);
+  const r = c.repo;
+  const [sub, name, url] = rest;
+  if (!sub) {
+    if (!r.remote) return out(c, '(no remotes yet)');
+    return out(c, set.has('-v') ? `${r.remote.name}\t${r.remote.url} (fetch)\n${r.remote.name}\t${r.remote.url} (push)` : r.remote.name);
+  }
+  if (sub === 'add') {
+    if (!name || !url) fail('usage: git remote add <name> <url>, like: git remote add origin https://github.com/you/my-site.git');
+    if (r.remote) fail(`error: remote ${r.remote.name} already exists.`);
+    if (!/^(https:\/\/|git@)[\w.@:/~-]+$/.test(url)) fail(`fatal: '${url}' doesn't look like a repository URL. Try https://github.com/you/my-site.git`);
+    r.remote = { name, url, branches: {}, tags: {}, pages: null, deploys: [] };
+    explain(c, `Saved the address of your GitHub repository under the short name "${name}". Nothing was uploaded yet: that's what git push does.`);
+    c.events.push({ type: 'files' });
+    return;
+  }
+  if (sub === 'remove' || sub === 'rm') {
+    needRemote(r);
+    r.remote = null;
+    r.tracking = {};
+    r.upstream = {};
+    return explain(c, 'Forgot the remote. The repository on GitHub still exists; this folder just no longer knows about it.');
+  }
+  if (sub === 'show') return out(c, needRemote(r).url);
+  fail(`error: unknown subcommand: ${sub}. Try: git remote add origin <url>, git remote -v`);
+}
+
+function deployIfPages(c: Ctx, branch: string) {
+  const rm = c.repo.remote!;
+  const tip = rm.branches[branch];
+  if (!rm.pages || rm.pages.branch !== branch || !tip) return;
+  if (rm.deploys[rm.deploys.length - 1]?.id === tip) return;
+  rm.deploys.push({ id: tip, n: rm.deploys.length + 1 });
+  out(c, `GitHub Pages: build and deployment #${rm.deploys.length} started for ${short(tip)}`);
+  explain(c, `Pages publishes whatever is on ${branch}, so this redeployed your site. Watch the live preview update.`);
+  c.events.push({ type: 'deploy', id: tip });
+}
+
+function gPush(c: Ctx, args: string[]) {
+  const { set, rest } = flags(args);
+  const r = c.repo;
+  const rm = needRemote(r);
+  const [remoteName, refArg] = rest;
+  if (remoteName && remoteName !== rm.name)
+    fail(`fatal: '${remoteName}' does not appear to be a git repository\nhint: your remote is called '${rm.name}' (see git remote -v)`);
+  const setUp = set.has('-u') || set.has('--set-upstream');
+  const force = set.has('-f') || set.has('--force') || set.has('--force-with-lease');
+  if (set.has('--tags')) {
+    const fresh = Object.keys(r.tags).filter((t) => rm.tags[t] !== r.tags[t]);
+    if (!fresh.length) return out(c, 'Everything up-to-date');
+    for (const t of fresh) pushTag(c, t);
+    return;
+  }
+  let ref = refArg;
+  if (!ref) {
+    if (r.head.kind !== 'branch') fail('fatal: You are not currently on a branch.\nhint: switch to a branch, or name one: git push origin main');
+    const b = (r.head as { name: string }).name;
+    if (!remoteName && !r.upstream[b] && !setUp)
+      fail(`fatal: The current branch ${b} has no upstream branch.\nTo push the current branch and set the remote as upstream, use\n\n    git push -u origin ${b}\n`);
+    ref = r.upstream[b] && !remoteName ? r.upstream[b] : b;
+  }
+  if (ref in r.tags && !(ref in r.branches)) return pushTag(c, ref);
+  if (!(ref in r.branches)) fail(`error: src refspec ${ref} does not match any`);
+  const local = r.branches[ref] ?? fail(`error: src refspec ${ref} does not match any (${ref} has no commits yet)`);
+  const old = rm.branches[ref];
+  const track = `${rm.name}/${ref}`;
+  if (setUp) r.upstream[ref] = ref;
+  if (old === local) {
+    r.tracking[track] = local;
+    out(c, 'Everything up-to-date');
+    return deployIfPages(c, ref);
+  }
+  const rewrite = !!old && !isAncestor(r, old, local);
+  if (rewrite && !force)
+    fail(
+      ` ! [rejected]        ${ref} -> ${ref} (fetch first)\nerror: failed to push some refs to '${rm.url}'\nhint: Updates were rejected because GitHub has commits you don't have yet.\nhint: Run "git pull" to bring them in, then push again.`,
+    );
+  const sent = newCommits(r, local, old);
+  rm.branches[ref] = local;
+  r.tracking[track] = local;
+  const range = old ? `${rewrite ? '+' : ' '}  ${short(old)}..${short(local)}` : ' * [new branch]     ';
+  out(c, `To ${rm.url}\n${range}  ${ref} -> ${ref}${rewrite ? ' (forced update)' : ''}`);
+  if (setUp) out(c, `branch '${ref}' set up to track '${track}'.`);
+  explain(
+    c,
+    `Uploaded ${plural(sent.length, 'commit')} to GitHub. ${ref} on GitHub now points at ${short(local)}, and the ${track} label in your graph shows where GitHub is.` +
+      (setUp ? ` Because of -u, plain "git push" and "git pull" on ${ref} now know where to go.` : '') +
+      (rewrite ? ' That was a force push: commits only GitHub had are gone from the branch. Avoid this on shared branches.' : ''),
+  );
+  c.events.push({ type: 'push', branch: ref, ids: sent });
+  deployIfPages(c, ref);
+}
+
+function pushTag(c: Ctx, tag: string) {
+  const r = c.repo;
+  const rm = r.remote!;
+  if (rm.tags[tag] === r.tags[tag]) return out(c, 'Everything up-to-date');
+  const id = r.tags[tag];
+  rm.tags[tag] = id;
+  out(c, `To ${rm.url}\n * [new tag]         ${tag} -> ${tag}`);
+  explain(c, `GitHub now has the tag ${tag} on ${short(id)}. Tags mark releases: the GitHub panel lists it under Releases.`);
+  c.events.push({ type: 'release', tag });
+}
+
+function gFetch(c: Ctx, args: string[]) {
+  const { rest } = flags(args);
+  const r = c.repo;
+  const rm = needRemote(r);
+  if (rest[0] && rest[0] !== rm.name) fail(`fatal: '${rest[0]}' does not appear to be a git repository`);
+  const lines: string[] = [];
+  const got: string[] = [];
+  for (const [b, id] of Object.entries(rm.branches)) {
+    const ref = `${rm.name}/${b}`;
+    const old = r.tracking[ref];
+    if (old === id) continue;
+    for (const x of newCommits(r, id, old)) if (!got.includes(x)) got.push(x);
+    lines.push(old ? `   ${short(old)}..${short(id)}  ${b.padEnd(10)} -> ${ref}` : ` * [new branch]      ${b.padEnd(10)} -> ${ref}`);
+    r.tracking[ref] = id;
+  }
+  if (!lines.length) return explain(c, 'Nothing new on GitHub: your remote-tracking branches were already current.');
+  out(c, `From ${rm.url}\n${lines.join('\n')}`);
+  explain(
+    c,
+    `Downloaded ${plural(got.length, 'new commit')} and moved the ${rm.name}/ labels to match GitHub. Your own branches did not move: fetch only looks, it never changes your work.`,
+  );
+  c.events.push({ type: 'fetch', ids: got });
+}
+
+function gPull(c: Ctx, args: string[]) {
+  const { set, rest } = flags(args);
+  const r = c.repo;
+  const rm = needRemote(r);
+  if (r.head.kind !== 'branch') fail('fatal: You are not currently on a branch. Switch to one before pulling.');
+  const b = (r.head as { name: string }).name;
+  const [remoteName, refArg] = rest;
+  if (remoteName && remoteName !== rm.name) fail(`fatal: '${remoteName}' does not appear to be a git repository`);
+  const up = refArg ?? r.upstream[b];
+  if (!up) fail(`There is no tracking information for the current branch.\nhint: name it: git pull origin ${b}\nhint: or link it once: git push -u origin ${b}`);
+  if (!(up in rm.branches)) fail(`fatal: couldn't find remote ref ${up}`);
+  if (!isClean(r)) fail('error: you have uncommitted changes that a pull could overwrite.\nhint: commit them, or "git stash" them and "git stash pop" after.');
+  gFetch(c, []);
+  const ref = `${rm.name}/${up}`;
+  if (set.has('--rebase')) return gRebase(c, [ref]);
+  gMerge(c, [ref, '-m', `Merge branch '${up}' of ${rm.url.replace(/^https:\/\//, '').replace(/\.git$/, '')}`]);
+}
+
+/** Hidden setup command: a teammate pushes a commit to GitHub. */
+function teammate(c: Ctx, args: string[]) {
+  const r = c.repo;
+  const rm = needRemote(r);
+  const [message, file, text, branch = 'main'] = args;
+  if (!message || !file || text === undefined) fail('usage: @teammate "message" <file> "line to add" [branch]');
+  const parent = rm.branches[branch] ?? null;
+  const tree = { ...treeOf(r, parent) };
+  tree[file] = (tree[file] ?? '') + text + '\n';
+  const id = addCommit(r, parent ? [parent] : [], message, tree);
+  rm.branches[branch] = id;
+  out(c, `(Sam pushed ${short(id)} "${message}" to ${branch} on GitHub)`);
+}
+
+/** The GitHub Settings -> Pages switch. Also used by lesson setups. */
+function enablePages(c: Ctx, branch: string) {
+  const rm = needRemote(c.repo);
+  rm.pages = { branch };
+  out(c, `GitHub Pages: publishing from ${branch}.`);
+  c.events.push({ type: 'files' });
+  deployIfPages(c, branch);
+}
+
 /** Build a repo by replaying commands silently. Used by lesson setups. */
 export function replay(commands: string[]): Repo {
   let r = emptyRepo();
@@ -1013,6 +1292,8 @@ export function completions(r: Repo): string[] {
     ...Object.keys(r.work),
     ...Object.keys(r.branches),
     ...Object.keys(r.tags),
+    ...Object.keys(r.tracking),
+    'remote', 'push', 'fetch', 'pull', 'origin', 'edit', '-u',
     'init', 'status', 'add', 'commit', 'log', 'branch', 'switch', 'checkout', 'merge', 'rebase', 'reset', 'restore',
     'revert', 'cherry-pick', 'stash', 'diff', 'show', 'tag', '--oneline', '--all', '--staged', '--hard', '--soft', '--abort', 'HEAD',
   ];

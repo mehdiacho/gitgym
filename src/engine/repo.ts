@@ -28,6 +28,18 @@ export interface MergeState {
   conflicts: string[];
 }
 
+/** The simulated GitHub side: a second set of refs that only push changes. */
+export interface Remote {
+  name: string;
+  url: string;
+  branches: Record<string, string>;
+  tags: Record<string, string>;
+  /** GitHub Pages: which branch it publishes, once switched on in Settings. */
+  pages: { branch: string } | null;
+  /** Every Pages deployment, oldest first. */
+  deploys: { id: string; n: number }[];
+}
+
 export interface Repo {
   initialized: boolean;
   commits: Record<string, Commit>;
@@ -42,6 +54,11 @@ export interface Repo {
   seq: number;
   merging: MergeState | null;
   stash: StashEntry[];
+  remote: Remote | null;
+  /** Remote-tracking refs like origin/main: what you last saw on GitHub. */
+  tracking: Record<string, string>;
+  /** Local branch -> the remote branch it pushes to and pulls from. */
+  upstream: Record<string, string>;
 }
 
 export function emptyRepo(): Repo {
@@ -57,6 +74,9 @@ export function emptyRepo(): Repo {
     seq: 0,
     merging: null,
     stash: [],
+    remote: null,
+    tracking: {},
+    upstream: {},
   };
 }
 
@@ -73,6 +93,11 @@ export function cloneRepo(r: Repo): Repo {
     work: { ...r.work },
     merging: r.merging ? { ...r.merging, conflicts: [...r.merging.conflicts] } : null,
     stash: [...r.stash],
+    remote: r.remote
+      ? { ...r.remote, branches: { ...r.remote.branches }, tags: { ...r.remote.tags }, pages: r.remote.pages && { ...r.remote.pages }, deploys: [...r.remote.deploys] }
+      : null,
+    tracking: { ...r.tracking },
+    upstream: { ...r.upstream },
   };
 }
 
@@ -123,6 +148,9 @@ export function reachable(r: Repo): Set<string> {
     headId(r),
     ...r.stash.map((s) => s.base),
     r.merging?.theirs ?? null,
+    ...Object.values(r.tracking),
+    ...Object.values(r.remote?.branches ?? {}),
+    ...Object.values(r.remote?.tags ?? {}),
   ];
   for (const t of tips) if (t) for (const c of ancestors(r, t)) out.add(c);
   return out;
@@ -145,6 +173,25 @@ export interface StatusReport {
   conflicts: string[];
 }
 
+function globToRe(g: string): RegExp {
+  return new RegExp('^' + g.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '[^/]*') + '$');
+}
+
+/** True if .gitignore in the working folder says to leave this path alone. */
+export function ignored(r: Repo, path: string): boolean {
+  const rules = (r.work['.gitignore'] ?? '')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith('#'));
+  return rules.some((rule) => {
+    const dir = rule.endsWith('/');
+    const pat = rule.replace(/^\//, '').replace(/\/$/, '');
+    if (dir) return path.startsWith(pat + '/') || path.split('/').slice(0, -1).some((seg) => globToRe(pat).test(seg));
+    const re = globToRe(pat);
+    return re.test(path) || (!pat.includes('/') && re.test(path.split('/').pop()!));
+  });
+}
+
 export function status(r: Repo): StatusReport {
   const head = headTree(r);
   const paths = new Set([...Object.keys(head), ...Object.keys(r.index), ...Object.keys(r.work)]);
@@ -164,7 +211,7 @@ export function status(r: Repo): StatusReport {
     if (i === undefined && w !== undefined) {
       if (h === undefined || i !== h) {
         // Not in the index: untracked (or deleted-then-recreated, which git also shows as untracked).
-        report.untracked.push(p);
+        if (!ignored(r, p)) report.untracked.push(p);
       }
     } else if (i !== undefined && w !== i) {
       report.unstaged.push({ path: p, change: w === undefined ? 'deleted' : 'modified' });
@@ -210,6 +257,66 @@ export interface MergeResult {
   conflicts: string[];
 }
 
+const splitLines = (s: string) => {
+  const a = s.split('\n');
+  if (a[a.length - 1] === '') a.pop();
+  return a;
+};
+
+/** For each line of `a`, the index of the matching line in `b` along a longest common subsequence, or -1. */
+function lcsMap(a: string[], b: string[]): number[] {
+  const m = a.length;
+  const n = b.length;
+  const dp = Array.from({ length: m + 1 }, () => new Array<number>(n + 1).fill(0));
+  for (let i = m - 1; i >= 0; i--) for (let j = n - 1; j >= 0; j--) dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  const map = new Array<number>(m).fill(-1);
+  let i = 0;
+  let j = 0;
+  while (i < m && j < n) {
+    if (a[i] === b[j]) map[i++] = j++;
+    else if (dp[i + 1][j] >= dp[i][j + 1]) i++;
+    else j++;
+  }
+  return map;
+}
+
+const same = (x: string[], y: string[]) => x.length === y.length && x.every((v, i) => v === y[i]);
+
+/** Line-level three-way merge (diff3 style). Only the lines both sides changed conflict. */
+export function merge3(base: string, ours: string, theirs: string, oursLabel: string, theirsLabel: string): { text: string; conflict: boolean } {
+  const B = splitLines(base);
+  const O = splitLines(ours);
+  const T = splitLines(theirs);
+  const mo = lcsMap(B, O);
+  const mt = lcsMap(B, T);
+  const outLines: string[] = [];
+  let conflict = false;
+  let i = 0;
+  let j = 0;
+  let k = 0;
+  for (;;) {
+    let x = i;
+    while (x < B.length && !(mo[x] >= j && mt[x] >= k)) x++;
+    const jo = x < B.length ? mo[x] : O.length;
+    const kt = x < B.length ? mt[x] : T.length;
+    const b = B.slice(i, x);
+    const o = O.slice(j, jo);
+    const t = T.slice(k, kt);
+    if (same(o, b)) outLines.push(...t);
+    else if (same(t, b) || same(o, t)) outLines.push(...o);
+    else {
+      conflict = true;
+      outLines.push(`<<<<<<< ${oursLabel}`, ...o, '=======', ...t, `>>>>>>> ${theirsLabel}`);
+    }
+    if (x >= B.length) break;
+    outLines.push(B[x]);
+    i = x + 1;
+    j = jo + 1;
+    k = kt + 1;
+  }
+  return { text: outLines.length ? outLines.join('\n') + '\n' : '', conflict };
+}
+
 export function mergeTrees(base: Tree, ours: Tree, theirs: Tree, oursLabel: string, theirsLabel: string): MergeResult {
   const out: Tree = {};
   const conflicts: string[] = [];
@@ -222,7 +329,13 @@ export function mergeTrees(base: Tree, ours: Tree, theirs: Tree, oursLabel: stri
     if (o === t) v = o;
     else if (o === b) v = t;
     else if (t === b) v = o;
-    else {
+    else if (o !== undefined && t !== undefined) {
+      // Both sides edited the file: merge line by line.
+      const m = merge3(b ?? '', o, t, oursLabel, theirsLabel);
+      v = m.text;
+      if (m.conflict) conflicts.push(p);
+    } else {
+      // One side deleted the file, the other changed it.
       conflicts.push(p);
       v = `<<<<<<< ${oursLabel}\n${o ?? ''}${o && !o.endsWith('\n') ? '\n' : ''}=======\n${t ?? ''}${t && !t.endsWith('\n') ? '\n' : ''}>>>>>>> ${theirsLabel}\n`;
     }

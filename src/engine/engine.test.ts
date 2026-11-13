@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { LESSONS } from '../lessons';
+import { LESSONS, setupFor } from '../lessons';
 import { headId, status } from './repo';
 import { replay, run, tokenize } from './shell';
 
@@ -82,21 +82,89 @@ describe('git basics', () => {
   });
 });
 
-describe('lessons', () => {
-  for (const lesson of LESSONS) {
-    it(`"${lesson.title}" sets up and is solved by its hints`, () => {
-      let r = replay(lesson.setup);
+describe('github', () => {
+  const base = ['git init', 'echo a > a && git add . && git commit -m a', 'git remote add origin https://github.com/you/x.git'];
+
+  it('push -u sets upstream and tracking', () => {
+    const r = replay([...base, 'git push -u origin main']);
+    expect(r.remote?.branches.main).toBe(r.branches.main);
+    expect(r.tracking['origin/main']).toBe(r.branches.main);
+    expect(r.upstream.main).toBe('main');
+  });
+
+  it('push without upstream explains -u', () => {
+    const res = run(replay(base), 'git push');
+    expect(res.lines.find((l) => l.kind === 'err')?.text).toContain('git push -u origin main');
+  });
+
+  it('rejects a push when GitHub has new work, pull fixes it', () => {
+    let r = replay([...base, 'git push -u origin main', '@teammate "theirs" b "x"', 'echo more >> a && git commit -am mine']);
+    expect(run(r, 'git push').lines.some((l) => l.kind === 'err' && l.text.includes('rejected'))).toBe(true);
+    r = run(r, 'git pull').repo;
+    expect(r.commits[r.branches.main!].parents).toHaveLength(2);
+    r = run(r, 'git push').repo;
+    expect(r.remote?.branches.main).toBe(r.branches.main);
+  });
+
+  it('fetch moves origin/main but not main', () => {
+    const r0 = replay([...base, 'git push -u origin main', '@teammate "theirs" b "x"']);
+    const r = run(r0, 'git fetch').repo;
+    expect(r.branches.main).toBe(r0.branches.main);
+    expect(r.tracking['origin/main']).toBe(r.remote?.branches.main);
+  });
+
+  it('pages deploys on push to the published branch', () => {
+    const r = replay([...base, 'git push -u origin main', '@pages main', 'echo b >> a && git commit -am b && git push']);
+    expect(r.remote?.deploys.map((d) => d.id)).toEqual([r.commits[r.branches.main!].parents[0], r.branches.main]);
+  });
+});
+
+describe('merging lines', () => {
+  it('merges edits to different lines of one file', () => {
+    const r = replay([
+      'git init',
+      'echo one > f && echo two >> f && echo three >> f && git add . && git commit -m base',
+      'git switch -c b && @line f 1 ONE && git commit -am b',
+      'git switch main && @line f 3 THREE && git commit -am m',
+      'git merge b',
+    ]);
+    expect(r.work.f).toBe('ONE\ntwo\nTHREE\n');
+    expect(r.merging).toBeNull();
+  });
+
+  it('only marks the lines both sides changed', () => {
+    const r = replay(['git init', 'echo t > f && echo body >> f && git add . && git commit -m base', 'git switch -c b && @line f 1 X && git commit -am b', 'git switch main && @line f 1 Y && git commit -am m']);
+    const m = run(r, 'git merge b').repo;
+    expect(m.work.f).toBe('<<<<<<< HEAD\nY\n=======\nX\n>>>>>>> b\nbody\n');
+  });
+
+  it('.gitignore hides files from status and add .', () => {
+    const r = replay(['git init', 'echo x > secret.txt', 'echo secret.txt > .gitignore', 'git add .']);
+    expect(Object.keys(r.index)).toEqual(['.gitignore']);
+    expect(status(r).untracked).toEqual([]);
+  });
+});
+
+describe('the journey', () => {
+  it('every lesson is solved by its canonical steps, one after another', () => {
+    let r = replay([]);
+    LESSONS.forEach((lesson, i) => {
+      for (const cmd of lesson.prep) {
+        const res = run(r, cmd);
+        expect(res.lines.find((l) => l.kind === 'err')?.text, `${lesson.id} prep "${cmd}"`).toBeUndefined();
+        r = res.repo;
+      }
+      expect(JSON.stringify(setupFor(i)), `${lesson.id} setupFor matches the journey`).toBe(JSON.stringify(r));
       const typed: string[] = [];
       const met = new Set<number>();
-      for (const h of lesson.hints) {
+      for (const h of lesson.solve ?? lesson.hints) {
         const res = run(r, h);
-        const err = res.lines.find((l) => l.kind === 'err');
-        expect(err?.text, `hint "${h}"`).toBeUndefined();
+        expect(res.lines.find((l) => l.kind === 'err')?.text, `${lesson.id} step "${h}"`).toBeUndefined();
         r = res.repo;
         typed.push(h);
-        lesson.goals.forEach((g, i) => g.check(r, typed) && met.add(i));
+        lesson.goals.forEach((g, gi) => g.check(r, typed) && met.add(gi));
       }
-      expect([...met].sort(), lesson.goals.map((g) => g.label).join(' | ')).toEqual(lesson.goals.map((_, i) => i));
+      expect([...met].sort(), `${lesson.id}: ${lesson.goals.map((g) => g.label).join(' | ')}`).toEqual(lesson.goals.map((_, gi) => gi));
     });
-  }
+  });
 });
